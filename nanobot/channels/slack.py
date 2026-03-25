@@ -67,6 +67,26 @@ class SlackChannel(BaseChannel):
         self._socket_client: SocketModeClient | None = None
         self._bot_user_id: str | None = None
         self._http: httpx.AsyncClient | None = None
+        self._local_whisper_model: Any | None = None
+
+    async def _transcribe_audio_local(self, file_path: str) -> str:
+        """Local Whisper fallback when provider transcription is unavailable."""
+        def _run_transcribe() -> str:
+            try:
+                import whisper
+            except Exception:
+                return ""
+
+            try:
+                if self._local_whisper_model is None:
+                    self._local_whisper_model = whisper.load_model("tiny")
+                result = self._local_whisper_model.transcribe(file_path, fp16=False)
+                return (result.get("text") or "").strip()
+            except Exception as e:
+                logger.debug("Local Whisper transcription failed: {}", e)
+                return ""
+
+        return await asyncio.to_thread(_run_transcribe)
 
     async def start(self) -> None:
         """Start the Slack Socket Mode client."""
@@ -290,7 +310,17 @@ class SlackChannel(BaseChannel):
 
                 mime = (f.get("mimetype") or mimetypes.guess_type(filename)[0] or "").lower()
                 media_type = "image" if mime.startswith("image/") else "audio" if mime.startswith("audio/") else "file"
-                content_tags.append(f"[{media_type}: {file_path}]")
+                if media_type == "audio":
+                    transcription = await self.transcribe_audio(file_path)
+                    if not transcription:
+                        transcription = await self._transcribe_audio_local(str(file_path))
+                    if transcription:
+                        logger.info("Transcribed Slack audio: {}...", transcription[:50])
+                        content_tags.append(f"[transcription: {transcription}]")
+                    else:
+                        content_tags.append(f"[audio: {file_path}]")
+                else:
+                    content_tags.append(f"[{media_type}: {file_path}]")
             except Exception as e:
                 logger.warning("Failed to download Slack attachment {}: {}", filename, e)
                 content_tags.append(f"[attachment: {filename} - download failed]")
